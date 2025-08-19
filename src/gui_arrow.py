@@ -1,4 +1,4 @@
-import argparse, math, heapq, time
+import argparse
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -10,7 +10,7 @@ import chess.svg as chess_svg
 
 from .model import SmallConvPolicy
 from .encoder import board_to_planes
-from .move_vocab import compose_uci, PROMO_TO_IDX
+from .move_vocab import PROMO_TO_IDX
 
 # -------- Inference --------
 @dataclass
@@ -20,14 +20,17 @@ class Predictor:
 
     @torch.no_grad()
     def legal_distribution(self, board: chess.Board):
-        """Probs over legal moves. p(move)=p_from*f * p_to*t * p_promo*p normalized to 1."""
+        """
+        Return probabilities over legal moves:
+        p(move) = p_from * p_to * p_promo, normalized over *legal* moves.
+        """
         x = torch.from_numpy(board_to_planes(board)).unsqueeze(0).to(self.device)
         out = self.model(x)
         pf = F.softmax(out["from"],  dim=1).squeeze(0)   # [64]
         pt = F.softmax(out["to"],    dim=1).squeeze(0)   # [64]
         pp = F.softmax(out["promo"], dim=1).squeeze(0)   # [5]
 
-        items = []
+        items: List[Tuple[str, float]] = []
         total = 0.0
         for m in board.legal_moves:
             f = int(m.from_square)
@@ -36,14 +39,64 @@ class Predictor:
             if m.promotion:
                 promo_idx = PROMO_TO_IDX[{chess.QUEEN:'q', chess.ROOK:'r', chess.BISHOP:'b', chess.KNIGHT:'n'}[m.promotion]]
             p = float(pf[f]) * float(pt[t]) * float(pp[promo_idx])
-            items.append([m.uci(), p])
+            items.append((m.uci(), p))
             total += p
 
-        if total <= 0:  # no legal moves
+        if total <= 0:
             return []
         items = [(uci, p/total) for uci, p in items]
         items.sort(key=lambda x: x[1], reverse=True)
         return items
+
+# -------- Notation formatter --------
+FILES = "abcdefgh"
+
+def _piece_letter(pt: int) -> str:
+    return {chess.KNIGHT:'N', chess.BISHOP:'B', chess.ROOK:'R', chess.QUEEN:'Q', chess.KING:'K'}.get(pt, '')
+
+def format_move_readable(board: chess.Board, uci: str) -> str:
+    """
+    Custom readable notation per your rules:
+    - Pieces: N,B,R,Q,K + disambiguation if needed.
+    - Pawns: just the destination square.
+    - Disambiguation: prefer file; if same file still ambiguous, use rank number.
+    """
+    m = chess.Move.from_uci(uci)
+    pt = board.piece_type_at(m.from_square)
+    dst = chess.square_name(m.to_square)
+
+    # Pawns: just destination (even for captures/promotions, per your request)
+    if pt == chess.PAWN:
+        return dst
+
+    letter = _piece_letter(pt)  # N,B,R,Q,K
+
+    # Find ambiguous *legal* moves: same to-square and same piece type
+    ambiguous = []
+    for lm in board.legal_moves:
+        if lm.to_square == m.to_square:
+            pt2 = board.piece_type_at(lm.from_square)
+            if pt2 == pt:
+                ambiguous.append(lm)
+
+    # No ambiguity?
+    if len(ambiguous) <= 1:
+        return f"{letter}{dst}"
+
+    # There is ambiguity. Check if another candidate shares the same file.
+    from_file = chess.square_file(m.from_square)  # 0..7
+    same_file_exists = any(
+        lm != m and chess.square_file(lm.from_square) == from_file
+        for lm in ambiguous
+    )
+
+    if same_file_exists:
+        # Use rank number (row) to disambiguate
+        rank_num = chess.square_rank(m.from_square) + 1  # 1..8
+        return f"{letter}{rank_num}{dst}"
+    else:
+        # Use file letter to disambiguate
+        return f"{letter}{FILES[from_file]}{dst}"
 
 # -------- App --------
 def make_app(ckpt_path: str):
@@ -58,7 +111,7 @@ def make_app(ckpt_path: str):
 
     app = Flask(__name__)
 
-    # --- HTML (no external JS/CSS) ---
+    # --- HTML/JS/CSS (LOCAL, no CDNs) ---
     PAGE = """
 <!doctype html>
 <html>
@@ -75,8 +128,7 @@ def make_app(ckpt_path: str):
     .board-wrap { position:relative; width:560px; max-width:70vw; }
     #boardImg { width:100%; height:auto; display:block; border-radius:12px; }
     .overlay { position:absolute; inset:0; display:grid; grid-template-columns:repeat(8,1fr); grid-template-rows:repeat(8,1fr); }
-    .sq { cursor:pointer; }
-    .sq.sel { outline:3px solid var(--brand); outline-offset:-3px; }
+    .sq { cursor:pointer; } /* removed big blue selection square */
     .controls { display:flex; flex-direction:column; gap:12px; min-width:300px; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
     button { background:#172243; color:var(--text); border:1px solid var(--border); padding:10px 12px; border-radius:10px; cursor:pointer; }
@@ -115,8 +167,6 @@ def make_app(ckpt_path: str):
 
   <script>
     const files = 'abcdefgh';
-    function idxToSq(i){ const f=i%8, r=Math.floor(i/8); return files[f] + (r+1); }
-    function sqAt(col,row){ return files[col] + (row+1); } // col 0..7 left->right, row 1..8 bottom->top
     function refreshBoard(){ document.getElementById('boardImg').src='/board.svg?ts=' + Date.now(); }
 
     async function api(path, method='GET', body=null){
@@ -126,13 +176,14 @@ def make_app(ckpt_path: str):
 
     function updateTop(sugg, cands){
       const pill = document.getElementById('suggestPill');
-      if(!sugg){ pill.textContent = 'No suggestion'; } else {
+      if(!sugg){ pill.textContent = 'No suggestion'; }
+      else {
         const pct = (sugg[1]*100).toFixed(1);
         pill.textContent = 'Suggested: ' + sugg[0] + ' (' + pct + '%)';
       }
       const ul = document.getElementById('candList'); ul.innerHTML='';
-      (cands||[]).slice(0,5).forEach(([u,p])=>{
-        const li=document.createElement('li'); li.innerHTML = u + ' <span class="pct">(' + (p*100).toFixed(1) + '%)</span>';
+      (cands||[]).slice(0,5).forEach(([label,p])=>{
+        const li=document.createElement('li'); li.innerHTML = label + ' <span class="pct">(' + (p*100).toFixed(1) + '%)</span>';
         ul.appendChild(li);
       });
     }
@@ -147,7 +198,7 @@ def make_app(ckpt_path: str):
 
     function buildOverlay(){
       const ov = document.getElementById('overlay'); ov.innerHTML='';
-      // 8x8 clickable cells; map row visually so a1 bottom-left.
+      // 8x8 clickable cells; a1 bottom-left visually
       for(let r=8; r>=1; --r){
         for(let c=0; c<8; ++c){
           const div=document.createElement('div');
@@ -160,7 +211,7 @@ def make_app(ckpt_path: str):
     }
 
     function choosePromo(from,to){
-      // See if there are promotion legals; if so, ask which one.
+      // If there are promotion legals, ask
       const options = LEGAL.filter(u=>u.startsWith(from+to) && u.length===5).map(u=>u[4]);
       if(options.length===0) return '';  // not a promotion
       const allowed = ['q','r','b','n'];
@@ -177,11 +228,9 @@ def make_app(ckpt_path: str):
         const sq = cell.dataset.sq;
 
         if(!from){
-          from = sq; cell.classList.add('sel');
+          from = sq; // no visual highlight anymore
           return;
         }else{
-          // find selected div to unselect
-          const sel = ov.querySelector('.sq.sel'); if(sel) sel.classList.remove('sel');
           const promo = choosePromo(from, sq);
           const uci = from + sq + promo;
           from = null;
@@ -200,7 +249,6 @@ def make_app(ckpt_path: str):
       document.getElementById('btnUndo').onclick = async ()=>{ await api('/api/undo','POST',{}); await refresh(); };
       document.getElementById('btnNew').onclick = async ()=>{ await api('/api/new','POST',{}); await refresh(); };
       await refresh();
-      // keep board responsive on resize (image gets new size; overlay tracks since it's absolute)
       window.addEventListener('resize', refreshBoard);
     }
     window.addEventListener('load', main);
@@ -215,7 +263,7 @@ def make_app(ckpt_path: str):
 
     @app.get("/board.svg")
     def board_svg():
-        # compute suggestion + arrow
+        # Arrow for suggested move (top of legal distribution)
         dist = predictor.legal_distribution(board)
         arrow = None
         if dist:
@@ -237,11 +285,22 @@ def make_app(ckpt_path: str):
 
     @app.get("/api/state")
     def api_state():
-        dist = predictor.legal_distribution(board)
+        dist = predictor.legal_distribution(board)  # list of (uci, prob)
+        # Convert to your readable labels
+        cands = []
+        for uci, p in dist[:5]:
+            label = format_move_readable(board, uci)
+            cands.append([label, p])
+
+        suggested = None
+        if dist:
+            label0 = format_move_readable(board, dist[0][0])
+            suggested = [label0, dist[0][1]]
+
         data = dict(
             fen=board.fen(),
-            suggested=dist[0] if dist else None,
-            candidates=dist[:5] if dist else [],
+            suggested=suggested,
+            candidates=cands,
             legal=[m.uci() for m in board.legal_moves],
         )
         return jsonify(data)
@@ -292,3 +351,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
