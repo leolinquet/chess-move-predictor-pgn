@@ -1,0 +1,22 @@
+# OS/editor
+.DS_Store
+.vscode/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data & artifacts
+data/
+runs/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.h5
+*.pgn
+*.zst
+# Secrets
+.env
